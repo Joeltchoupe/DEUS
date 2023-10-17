@@ -1,3 +1,8 @@
+from consensus import amount
+from primitives import transaction
+from consensus import validation
+
+
 def check_transaction(tx, state):
     """
     Vérifie la validité de la transaction.
