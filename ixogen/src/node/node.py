@@ -739,5 +739,302 @@ def get_transaction(block_index: Optional[BlockIndex], mempool: Optional[Mempool
 
     return None
 
+#------------------------------------------------------------------------------------------------------------------------------------------
+
+from . import psbt
+
+def analyze_psbt(psbtx: psbt.PartiallySignedTransaction) -> psbt.PSBTAnalysis:
+    """Analyzes a PSBT and returns a PSBTAnalysis object.
+
+    Args:
+        psbtx (psbt.PartiallySignedTransaction): The PSBT to analyze.
+
+    Returns:
+        psbt.PSBTAnalysis: A PSBTAnalysis object.
+    """
+
+    result = psbt.PSBTAnalysis()
+
+    calc_fee = True
+
+    in_amt = 0
+
+    result.inputs.resize(len(psbtx.tx.vin))
+
+    txdata = psbt.PrecomputePSBTData(psbtx)
+
+    for i in range(len(psbtx.tx.vin)):
+        input = psbtx.inputs[i]
+        input_analysis = result.inputs[i]
+
+        # We set next role here and ratchet backwards as required
+        input_analysis.next = psbt.PSBTRole.EXTRACTOR
+
+        # Check for a UTXO
+        utxo = psbtx.GetInputUTXO(i)
+        if utxo:
+            if not MoneyRange(utxo.nValue) or not MoneyRange(in_amt + utxo.nValue):
+                result.SetInvalid(f"PSBT is not valid. Input {i} has invalid value")
+                return result
+
+            in_amt += utxo.nValue
+            input_analysis.has_utxo = True
+        else:
+            if input.non_witness_utxo and psbtx.tx.vin[i].prevout.n >= len(input.non_witness_utxo.vout):
+                result.SetInvalid(f"PSBT is not valid. Input {i} specifies invalid prevout")
+                return result
+
+            input_analysis.has_utxo = False
+            input_analysis.is_final = False
+            input_analysis.next = psbt.PSBTRole.UPDATER
+            calc_fee = False
+
+        if utxo and utxo.scriptPubKey.IsUnspendable():
+            result.SetInvalid(f"PSBT is not valid. Input {i} spends unspendable output")
+            return result
+
+        # Check if it is final
+        if not psbt.PSBTInputSignedAndVerified(psbtx, i, txdata):
+            input_analysis.is_final = False
+
+            # Figure out what is missing
+            outdata = psbt.SignatureData()
+            complete = psbt.SignPSBTInput(psbtx, i, txdata, 1, outdata)
+
+            # Things are missing
+            if not complete:
+                input_analysis.missing_pubkeys = outdata.missing_pubkeys
+                input_analysis.missing_redeem_script = outdata.missing_redeem_script
+                input_analysis.missing_witness_script = outdata.missing_witness_script
+                input_analysis.missing_sigs = outdata.missing_sigs
+
+                # If we are only missing signatures and nothing else, then next is signer
+                if not outdata.missing_pubkeys and outdata.missing_redeem_script is None and outdata.missing_witness_script is None and len(outdata.missing_sigs) > 0:
+                    input_analysis.next = psbt.PSBTRole.SIGNER
+                else:
+                    input_analysis.next = psbt.PSBTRole.UPDATER
+            else:
+                input_analysis.next = psbt.PSBTRole.FINALIZER
+        elif utxo:
+            input_analysis.is_final = True
+
+    # Calculate next role for PSBT by grabbing "minimum" PSBTInput next role
+    result.next = psbt.PSBTRole.EXTRACTOR
+    for input_analysis in result.inputs:
+        result.next = min(result.next, input_analysis.next)
+    assert result.next > psbt.PSBTRole.CREATOR
+
+    if calc_fee:
+        # Get the output amount
+        out_amt = sum(txout.nValue for txout in psbtx.tx.vout)
+        if not MoneyRange(out_amt):
+            result.SetInvalid("PSBT is not valid. Output amount invalid")
+            return result
+
+        # Get the fee
+        fee = in_amt - out_amt
+        result.fee = fee
+
+        # Estimate the size
+                # Estimate the size
+        mtx = psbtx.tx.copy()
+        view = CCoinsView()
+        success = True
+
+        for i in range(len(psbtx.tx.vin)):
+            input = psbtx.inputs[i]
+            coin = Coin()
+
+            if not psbt.SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, None, 1) or not psbtx.GetInputUTXO(coin.out, i):
+                success = False
+                break
+            else:
+                mtx.vin[i].scriptSig = input.final_script_sig
+                mtx.vin[i].scriptWitness = input.final_script_witness
+                coin.nHeight = 1
+                view.AddCoin(psbtx.tx.vin[i].prevout, std::move(coin), True)
+
+        if success:
+            size = GetVirtualTransactionSize(mtx, GetTransactionSigOpCost(mtx, view, STANDARD_SCRIPT_VERIFY_FLAGS), ::nBytesPerSigOp)
+            result.estimated_vsize = size
+            # Estimate fee rate
+            feerate = CFeeRate(fee, size)
+            result.estimated_feerate = feerate
+
+    return result
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------
+
+class TxReconciliationTracker:
+    def __init__(self, recon_version: int):
+        self._impl = TxReconciliationTrackerImpl(recon_version)
+
+    def pre_register_peer(self, peer_id: NodeId) -> int:
+        return self._impl.pre_register_peer(peer_id)
+
+    def register_peer(self, peer_id: NodeId, is_peer_inbound: bool, peer_recon_version: int, remote_salt: int) -> ReconciliationRegisterResult:
+        return self._impl.register_peer(peer_id, is_peer_inbound, peer_recon_version, remote_salt)
+
+    def forget_peer(self, peer_id: NodeId):
+        self._impl.forget_peer(peer_id)
+
+    def is_peer_registered(self, peer_id: NodeId) -> bool:
+        return self._impl.is_peer_registered(peer_id)
+
+
+class TxReconciliationTrackerImpl:
+    def __init__(self, recon_version: int):
+        self._lock = Mutex()
+        self._recon_version = recon_version
+        self._states = {}
+
+    def pre_register_peer(self, peer_id: NodeId) -> int:
+        with self._lock:
+            local_salt = GetRand(UINT64_MAX)
+            self._states[peer_id] = local_salt
+            return local_salt
+
+    def register_peer(self, peer_id: NodeId, is_peer_inbound: bool, peer_recon_version: int, remote_salt: int) -> ReconciliationRegisterResult:
+        with self._lock:
+            recon_state = self._states.get(peer_id)
+            if recon_state is None:
+                return ReconciliationRegisterResult.NOT_FOUND
+
+            if isinstance(recon_state, TxReconciliationState):
+                return ReconciliationRegisterResult.ALREADY_REGISTERED
+
+            local_salt = recon_state
+
+            # If the peer supports a version which is lower than ours, we downgrade to the version
+            # it supports. For now, this only guarantees that nodes with future reconciliation
+            # versions have the choice of reconciling with this current version. However, they also
+            # have the choice to refuse supporting reconciliations if the common version is not
+            # satisfactory (e.g. too low).
+            recon_version = min(peer_recon_version, self._recon_version)
+            # v1 is the lowest version, so suggesting something below must be a protocol violation.
+            if recon_version < 1:
+                return ReconciliationRegisterResult.PROTOCOL_VIOLATION
+
+            full_salt = ComputeSalt(local_salt, remote_salt)
+            recon_state = TxReconciliationState(!is_peer_inbound, full_salt.GetUint64(0), full_salt.GetUint64(1))
+            self._states[peer_id] = recon_state
+            return ReconciliationRegisterResult.SUCCESS
+
+    def forget_peer(self, peer_id: NodeId):
+        with self._lock:
+            if peer_id in self._states:
+                del self._states[peer_id]
+
+    def is_peer_registered(self, peer_id: NodeId) -> bool:
+        with self._lock:
+            recon_state = self._states.get(peer_id)
+            return isinstance(recon_state, TxReconciliationState)
+
+#-------------------------------------------------------------------------------------------------------------------------------------------
+
+import logging
+import os
+from typing import Optional
+
+import util.fs as fs
+
+from .chainstate import Chainstate
+from .coinsdb import CoinsDB
+
+SNAPSHOT_BLOCKHASH_FILENAME = "snapshot_blockhash"
+
+def write_snapshot_base_blockhash(snapshot_chainstate: Chainstate) -> bool:
+    """Writes the base blockhash of the snapshot chainstate to a file.
+
+    Args:
+        snapshot_chainstate: The snapshot chainstate.
+
+    Returns:
+        True if the write was successful, False otherwise.
+    """
+
+    assert snapshot_chainstate.m_from_snapshot_blockhash is not None
+
+    chaindir = snapshot_chainstate.CoinsDB().StoragePath()
+    assert chaindir is not None
+
+    write_to = os.path.join(chaindir, SNAPSHOT_BLOCKHASH_FILENAME)
+
+    with open(write_to, "wb") as f:
+        f.write(snapshot_chainstate.m_from_snapshot_blockhash.ToBytes())
+
+    return True
+
+def read_snapshot_base_blockhash(chaindir: str) -> Optional[bytes]:
+    """Reads the base blockhash of the snapshot chainstate from a file.
+
+    Args:
+        chaindir: The directory containing the snapshot chainstate.
+
+    Returns:
+        The base blockhash of the snapshot chainstate, or None if it could not be read.
+    """
+
+    if not os.path.exists(chaindir):
+        logging.error("cannot read base blockhash: no chainstate dir exists at path %s\n", chaindir)
+        return None
+
+    read_from = os.path.join(chaindir, SNAPSHOT_BLOCKHASH_FILENAME)
+
+    if not os.path.exists(read_from):
+        logging.error("snapshot chainstate dir is malformed! no base blockhash file "
+            "exists at path %s. Try deleting %s and calling loadtxoutset again?\n",
+            chaindir, read_from)
+        return None
+
+    base_blockhash = bytearray()
+
+    with open(read_from, "rb") as f:
+        base_blockhash += f.read()
+
+    return base_blockhash
+
+def find_snapshot_chainstate_dir(data_dir: str) -> Optional[str]:
+    """Finds the directory containing the snapshot chainstate.
+
+    Args:
+        data_dir: The data directory.
+
+    Returns:
+        The directory containing the snapshot chainstate, or None if it could not be found.
+    """
+
+    possible_dir = os.path.join(data_dir, f"chainstate{SNAPSHOT_CHAINSTATE_SUFFIX}")
+
+    if os.path.exists(possible_dir):
+        return possible_dir
+
+    return None
+
+#-------------------------------------------------------------------------------------------------------------------------------------------
+
+import argparse
+
+from kernel.validation_cache_sizes import ValidationCacheSizes
+
+def apply_args_man_options(argsman: argparse.ArgumentParser, cache_sizes: ValidationCacheSizes) -> None:
+    """Applies the arguments from the given argument manager to the validation cache sizes.
+
+    Args:
+        argsman: The argument manager.
+        cache_sizes: The validation cache sizes.
+    """
+
+    if argsman.get("maxsigcachesize"):
+        max_size = argsman.get_int("maxsigcachesize")
+        # 1. When supplied with a max_size of 0, both InitSignatureCache and
+        #    InitScriptExecutionCache create the minimum possible cache (2
+        #    elements). Therefore, we can use 0 as a floor here.
+        # 2. Multiply first, divide after to avoid integer truncation.
+        clamped_size_each = max(max_size, 0) * (1 << 20) // 2
+        cache_sizes = ValidationCacheSizes(
+            signature_cache_bytes=clamped_size_each,
+            script_execution_cache_bytes=clamped_size_each,
+        )
 
 
