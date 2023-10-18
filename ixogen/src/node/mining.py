@@ -164,7 +164,7 @@ def generateblock(address_or_descriptor, raw_txs_or_txids, submit=True):
         obj["warnings"] = GetWarnings(False).original
 
         return obj
-
+#
 def prioritisetransaction(txid, fee_delta):
 
     with LOCK(cs_main):
