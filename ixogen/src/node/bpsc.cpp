@@ -1,7 +1,9 @@
 #the mempool of the bpsc is a volatile space in the RAM of 10 seconds' expiry deadline, where hte bpsc stores the transactions received in order to process it; 
 #after 10 seconds it should have validated and created a block of these transactions, otherwise they are directly suppressed or redirected to another bpsc
+
 //les frais de transactions collectés par le bpsc sont envoyés au wallet father et il la coinbase est envoyée au noeud du bpsc et utilisable après 
 // Vérifie si une transaction est valide et peut être ajoutée au mempool
+
 bool AcceptTransaction(const CTransaction& tx, CValidationState& state)
 {
   // Vérifie que les scripts d'entrée sont valides
