@@ -11,3 +11,8 @@ git init
 mkdir src
 mkdir tests
 touch README.md
+#
+cd src
+mkdir blockchain
+mkdir preuve_stockage
+mkdir spacetime
