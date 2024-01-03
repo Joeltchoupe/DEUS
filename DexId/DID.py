@@ -36,3 +36,4 @@ class DexId:
 dex_id_instance = DexId()
 blockchain_transaction_result = dex_id_instance.register_did_on_blockchain()
 print(blockchain_transaction_result)
+
